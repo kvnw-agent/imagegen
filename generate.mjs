@@ -36,11 +36,11 @@ for (let i = 0; i < args.length; i++) {
   if (args[i] === "--help") {
     console.log(`Usage: node generate.mjs "prompt" [options]
 Options:
-  --model MODEL   OpenRouter model (default: openai/dall-e-3)
+  --model MODEL   OpenRouter model (default: google/gemini-2.5-flash-image)
   --output FILE   Output file path (default: output.png)
-  --size SIZE     Image size (default: 1024x1024)
+  --size SIZE     Image size for DALL-E models (default: 1024x1024)
 
-Env: OPENROUTER_API_KEY=your_key`);
+Env: ~/.config/openrouter/.env (OPENROUTER_API_KEY)`);
     process.exit(0);
   }
   if (!prompt) prompt = args[i];
@@ -51,55 +51,112 @@ if (!prompt) {
   process.exit(1);
 }
 
-const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: OPENROUTER_API_KEY,
-});
-
 console.log(`Generating image...`);
 console.log(`  Model: ${model}`);
-console.log(`  Size: ${size}`);
 console.log(`  Prompt: ${prompt}`);
 
-try {
-  const response = await client.images.generate({
-    model,
-    prompt,
-    n: 1,
-    size,
-    response_format: "b64_json",
-  });
+const isDalle = model.includes("dall-e");
 
-  const imageData = response.data[0].b64_json;
-  const buffer = Buffer.from(imageData, "base64");
-  const outPath = resolve(output);
-  writeFileSync(outPath, buffer);
-  console.log(`\n✅ Saved to ${outPath} (${(buffer.length / 1024).toFixed(1)} KB)`);
-} catch (err) {
-  // Some models return URL instead of b64
-  if (err.message?.includes("b64_json")) {
-    console.log("Retrying with url format...");
-    try {
-      const response = await client.images.generate({
+try {
+  if (isDalle) {
+    // DALL-E uses the images API
+    const client = new OpenAI({
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey: OPENROUTER_API_KEY,
+    });
+    const response = await client.images.generate({
+      model, prompt, n: 1, size,
+      response_format: "b64_json",
+    });
+    const buffer = Buffer.from(response.data[0].b64_json, "base64");
+    const outPath = resolve(output);
+    writeFileSync(outPath, buffer);
+    console.log(`\n✅ Saved to ${outPath} (${(buffer.length / 1024).toFixed(1)} KB)`);
+  } else {
+    // Chat-based image generation (Gemini, etc.)
+    // Images come back in message.images[] as {type: "image_url", image_url: {url: "data:..."}}
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
         model,
-        prompt,
-        n: 1,
-        size,
-      });
-      const url = response.data[0].url;
-      if (url) {
-        const res = await fetch(url);
-        const buffer = Buffer.from(await res.arrayBuffer());
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error("API Error:", JSON.stringify(data, null, 2));
+      process.exit(1);
+    }
+
+    const message = data.choices?.[0]?.message;
+    if (!message) {
+      console.error("No message in response");
+      process.exit(1);
+    }
+
+    // Check message.images[] (OpenRouter's format for Gemini image output)
+    const images = message.images;
+    if (Array.isArray(images) && images.length > 0) {
+      const img = images[0];
+      let buffer;
+
+      if (typeof img === "string") {
+        const b64 = img.startsWith("data:") ? img.split(",")[1] : img;
+        buffer = Buffer.from(b64, "base64");
+      } else if (img?.image_url?.url) {
+        const url = img.image_url.url;
+        if (url.startsWith("data:")) {
+          buffer = Buffer.from(url.split(",")[1], "base64");
+        } else {
+          const res = await fetch(url);
+          buffer = Buffer.from(await res.arrayBuffer());
+        }
+      }
+
+      if (buffer) {
         const outPath = resolve(output);
         writeFileSync(outPath, buffer);
         console.log(`\n✅ Saved to ${outPath} (${(buffer.length / 1024).toFixed(1)} KB)`);
+
+        // Print any text content too
+        if (message.content) {
+          console.log(`  Caption: ${typeof message.content === "string" ? message.content.trim() : ""}`);
+        }
+      } else {
+        console.error("Could not decode image from response");
+        process.exit(1);
       }
-    } catch (err2) {
-      console.error("Error:", err2.message || err2);
-      process.exit(1);
+    } else {
+      // Fallback: check content array
+      let saved = false;
+      if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (part.type === "image_url" && part.image_url?.url) {
+            const url = part.image_url.url;
+            const b64 = url.startsWith("data:") ? url.split(",")[1] : null;
+            const buffer = b64
+              ? Buffer.from(b64, "base64")
+              : Buffer.from(await (await fetch(url)).arrayBuffer());
+            writeFileSync(resolve(output), buffer);
+            console.log(`\n✅ Saved to ${resolve(output)} (${(buffer.length / 1024).toFixed(1)} KB)`);
+            saved = true;
+            break;
+          }
+        }
+      }
+      if (!saved) {
+        console.error("No image found in response.");
+        console.error("Text:", typeof message.content === "string" ? message.content.slice(0, 300) : JSON.stringify(message.content)?.slice(0, 300));
+        process.exit(1);
+      }
     }
-  } else {
-    console.error("Error:", err.message || err);
-    process.exit(1);
   }
+} catch (err) {
+  console.error("Error:", err.message || err);
+  process.exit(1);
 }
